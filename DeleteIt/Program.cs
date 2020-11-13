@@ -3,58 +3,118 @@ using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.ComponentModel;
+using System.Management;
 
 namespace DeleteIt
 {
     public class Program
     {
+        private static WindowsExplorerIntegrationService windowsExplorerIntegrationService = new WindowsExplorerIntegrationService();
+
         public static void Main(string[] args)
         {
+            args = new string[] { @"C:\Users\Sebastian\Desktop\New folder" };
+
+            if (args.FirstOrDefault() == "install")
+            {
+                windowsExplorerIntegrationService.InstallContextMenuEntries();
+                Console.WriteLine("Successfully installed windows explorer integration.");
+                return;
+            }
+            if (args.FirstOrDefault() == "uninstall")
+            {
+                windowsExplorerIntegrationService.UnintsallContextMenuEntries();
+                Console.WriteLine("Successfully uninstalled windows explorer integration.");
+                return;
+            }
+
             foreach (string arg in args)
             {
-                DeleteFile(arg);
+                string path = Path.GetFullPath(arg);
+                if (File.GetAttributes(path).HasFlag(FileAttributes.Directory))
+                {
+                    DeleteDirectoryRecursive(path);
+                }
+                else
+                {
+                    DeleteFile(path);
+                }
             }
             Console.WriteLine($"Successfully deleted {args.Length} file(s).");
         }
 
+        private static void DeleteDirectoryRecursive(string path)
+        {
+            foreach (string filePath in Directory.EnumerateFiles(path))
+            {
+                DeleteFile(filePath);
+            }
+            foreach (string directoryPath in Directory.EnumerateDirectories(path))
+            {
+                DeleteDirectory(directoryPath);
+            }
+            DeleteDirectory(path);
+        }
+
+        private static void DeleteDirectory(string directory)
+        {
+            try
+            {
+                Directory.Delete(directory);
+            }
+            catch
+            {
+                var processes = FindLockingProcessesByWMI(directory);
+                KillProcesses(processes);
+                ExecuteWithRetry(10, () => Directory.Delete(directory));
+            }
+        }
+
         private static void DeleteFile(string file)
         {
-            var processes = FindLockingProcesses(file);
-
-            if (processes.Count > 0)
+            try
             {
-                foreach (Process process in processes)
-                {
-                    try
-                    {
-                        KillLocalProcess(process.ProcessName);
-                    }
-                    catch (InvalidOperationException ex) // may happen
-                    {
-                        Console.WriteLine(ex.Message);
-                    }
-                }
                 File.Delete(file);
             }
-            else
+            catch
             {
-                File.Delete(file);
+                var processes = FindLockingProcessesByRestartManager(file);
+                KillProcesses(processes);
+                ExecuteWithRetry(10, () => File.Delete(file));
             }
         }
 
-        private static void KillLocalProcess(string processName)
+        private static void KillProcesses(IEnumerable<Process> processes)
         {
-            foreach (Process process in Process.GetProcessesByName(processName))
+            foreach (Process process in processes)
             {
-                process.Kill();
+                try
+                {
+                    process.Kill();
+                    process.WaitForExit(100);
+                }
+                catch (InvalidOperationException ex) // may happen
+                {
+                    Console.WriteLine(ex.Message);
+                }
             }
         }
 
+        private static List<Process> FindLockingProcessesByWMI(string path)
+        {
+            using var searcher = new ManagementObjectSearcher($"SELECT * FROM Win32_Process");
+            using ManagementObjectCollection objects = searcher.Get();
+            return objects.Cast<ManagementBaseObject>()
+                .Where(result => result["CommandLine"]?.ToString().Contains(path) ?? false)
+                .Select(result => Process.GetProcessById((int)(uint)result["ProcessId"])).ToList();
+        }
 
         /// <summary>
         /// Finds all processes that have a lock on the specified file.
         /// </summary>
-        private static List<Process> FindLockingProcesses(string path)
+        private static List<Process> FindLockingProcessesByRestartManager(string path)
         {
             // http://csharphelper.com/blog/2017/01/see-processes-file-locked-c/ 
             // http://msdn.microsoft.com/en-us/library/windows/desktop/aa373661(v=vs.85).aspx
@@ -124,6 +184,24 @@ namespace DeleteIt
 
             return processes;
         }
+
+        private static void ExecuteWithRetry(int retryCount, Action action)
+        {
+            int tries = 0;
+            while (tries < retryCount + 1)
+            {
+                try
+                {
+                    action();
+                    return;
+                }
+                catch
+                {
+                    tries++;
+                }
+            }
+        }
+
 
         [StructLayout(LayoutKind.Sequential)]
         struct RM_UNIQUE_PROCESS
